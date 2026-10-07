@@ -61,12 +61,29 @@ impl ChatComposer {
             .map_or(/*default*/ 0, |line| line.width() as u16);
         let width = max_left_width_for_right(area, right_width)
             .unwrap_or_else(|| inset_footer_hint_area(area).width);
+        let matrix_visible = line
+            .as_ref()
+            .is_some_and(|line| line.width().min(12) + 13 <= usize::from(width))
+            && crate::matrix_rain::output_rain().is_some();
+        let now = std::time::Instant::now();
         let transition = self
             .effort_status_line_transition
             .as_ref()
             .filter(|transition| !transition.is_finished());
         let line = if let Some(transition) = transition {
-            transition.render_line(line.as_ref(), width)
+            transition.render_line(
+                line.as_ref(),
+                width.saturating_sub(if matrix_visible { 13 } else { 0 }),
+            )
+        } else {
+            line
+        };
+        let matrix_visible = matrix_visible && line.is_some();
+        let line = if matrix_visible {
+            line.map(|line| {
+                self.matrix_activity
+                    .prefix_status_line(now, self.matrix_animation_enabled, line)
+            })
         } else {
             line
         };
@@ -87,6 +104,14 @@ impl ChatComposer {
             && let Some(frame_requester) = &self.frame_requester
         {
             frame_requester.schedule_frame_in(EFFORT_STATUS_LINE_FRAME_TICK);
+        }
+        if matrix_visible
+            && let Some(next_frame) = self
+                .matrix_activity
+                .next_frame_in(now, self.matrix_animation_enabled)
+            && let Some(frame_requester) = &self.frame_requester
+        {
+            frame_requester.schedule_frame_in(next_frame);
         }
     }
 }

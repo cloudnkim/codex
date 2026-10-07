@@ -5191,6 +5191,60 @@ mod tests {
         assert_eq!(cells(&activity, now), "CODEX READY");
     }
 
+    #[test]
+    #[ignore = "run alone with CODEX_MATRIX_RAIN=1"]
+    fn matrix_activity_separate_status_surface() {
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (210, 210, 210),
+                bg: (20, 20, 20),
+            },
+            || {
+                assert!(crate::matrix_rain::output_rain().is_some());
+                let (tx, _rx) = unbounded_channel();
+                let mut composer = ChatComposer::new(
+                    /*has_input_focus*/ true,
+                    AppEventSender::new(tx),
+                    /*enhanced_keys_supported*/ false,
+                    "Ask Codex".to_string(),
+                    /*disable_paste_burst*/ true,
+                );
+                composer.set_status_line_enabled(/*enabled*/ true);
+                composer.set_status_line(Some(Line::from("MODEL")));
+                let render_status = |composer: &ChatComposer, width: u16| {
+                    let options = ComposerRenderOptions {
+                        separate_status_line: true,
+                        ..ComposerRenderOptions::default()
+                    };
+                    let area = Rect::new(
+                        /*x*/ 0,
+                        /*y*/ 0,
+                        width,
+                        composer.desired_height_with_options(width, options),
+                    );
+                    let mut buffer = Buffer::empty(area);
+                    composer.render_with_options(
+                        area,
+                        &mut buffer,
+                        /*mask_char*/ None,
+                        options,
+                    );
+                    buffer
+                        .content
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                };
+                assert!(render_status(&composer, 80).contains("CODEX READY  MODEL"));
+                composer.start_matrix_activity();
+                assert!(render_status(&composer, 80).contains("01AF7 01AF7  MODEL"));
+                composer.complete_matrix_activity();
+                assert!(render_status(&composer, 80).contains("CODEX ÉXITO  MODEL"));
+                assert!(!render_status(&composer, 17).contains("CODEX"));
+            },
+        );
+    }
+
     use crate::bottom_pane::AppEventSender;
     use crate::bottom_pane::ChatComposer;
     use crate::bottom_pane::InputResult;
