@@ -27,6 +27,28 @@ cargo build --locked --release -p codex-cli --bin codex
 CODEX_MATRIX_RAIN=1 ./target/release/codex
 ```
 
+## 로컬 자동 업데이트
+
+- `codex-sol`과 `codex-astra`는 공통 Matrix 런처에서 실행 전 최신 포크 릴리즈를 확인한다.
+- 새 패키지의 체크섬·서명·버전을 확인한 뒤 설치한다.
+- 설치가 완료된 패키지로 실행 경로를 한 번에 전환한다.
+- 이전 패키지는 보존한다.
+- 이미 실행 중인 Codex는 해당 패키지를 계속 사용한다.
+- 새 빌드가 게시된 뒤 다음 실행부터 새 버전을 사용한다.
+- 다운로드·검증 실패나 다른 업데이트 실행 중에는 기존 버전으로 실행한다.
+- `sol`·`astra` 프로필과 CLI 인자는 그대로 전달한다.
+- `~/.codex/packages/matrix/fallback`을 기존 Matrix 패키지 디렉터리에 연결한다.
+- Python `3.12` 이상을 사용한다.
+
+```sh
+mkdir -p "$HOME/.codex/bin"
+install -m 755 scripts/update-matrix.py "$HOME/.codex/bin/update-matrix.py"
+install -m 755 scripts/matrix-launcher.sh "$HOME/.codex/bin/codex-matrix"
+```
+
+- 실행 도구: [scripts/update-matrix.py](scripts/update-matrix.py)
+- 공통 런처: [scripts/matrix-launcher.sh](scripts/matrix-launcher.sh)
+
 ## 예약
 
 - 기본 브랜치 `matrix`에서 `Codex Matrix 공식 릴리즈 반영` 워크플로를 실행한다.
