@@ -20,6 +20,11 @@
 - TrueColor 또는 ANSI 256색 터미널을 사용한다.
 - 릴리즈 패키지의 `bin/codex-matrix`는 효과를 켜고 CLI 인자를 그대로 전달한다.
 - 패키지의 `bin/codex`는 실행 환경의 효과 설정을 따른다.
+- 다른 Apple Silicon 맥에서는 릴리즈 패키지의 압축을 풀고 `sh ./install.command`로 설치한다.
+- 설치한 `~/.codex/bin/codex-matrix-X.Y.Z`는 해당 버전을 실행한다.
+- 설치에는 Rust·Node.js·Python이 필요하지 않다.
+- 기존 설정·인증·명령은 보존하고 버전별로 별도 설치한다.
+- 버전별 설치 명령은 로컬 자동 업데이트 런처와 별도로 사용한다.
 
 ```sh
 cd codex-rs
@@ -66,7 +71,7 @@ install -m 755 scripts/matrix-launcher.sh "$HOME/.codex/bin/codex-matrix"
 3. 해당 소스의 고정 Rust 툴체인으로 `codex-cli`의 `codex` 릴리스 바이너리만 빌드한다.
 4. CLI 버전이 공식 버전과 일치하는지 확인한다.
 5. 공식 macOS Apple Silicon 전체 패키지의 SHA-256을 검증한다.
-6. 패키지의 CLI를 교체하고 보조 실행 파일·리소스·라이선스를 보존한다.
+6. 패키지의 CLI를 교체하고 보조 실행 파일·리소스·라이선스·설치 스크립트를 포함한다.
 7. 실행 래퍼·서명·구성·SHA-256을 확인한다.
 8. 빌드한 소스 커밋을 `matrix`에 일반 푸시한다.
 9. 초안 릴리즈에 패키지와 체크섬을 첨부한다.

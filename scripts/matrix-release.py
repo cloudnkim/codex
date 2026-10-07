@@ -156,6 +156,8 @@ def prepare_source(version, base):
         raise ValueError("Build requires a clean tracked checkout")
     protected = (
         "scripts/matrix-release.py",
+        "scripts/package-matrix-macos.py",
+        "scripts/install-matrix-macos.sh",
         ".github/workflows/matrix-release.yml",
         "matrix-baseline-version.txt",
     )
@@ -305,25 +307,20 @@ def build():
     shutil.copy2(binary, package / "bin/codex")
     run("codesign", "--force", "--sign", "-", str(package / "bin/codex"))
     run("codesign", "--verify", "--strict", str(package / "bin/codex"))
-    wrapper = package / "bin/codex-matrix"
-    wrapper.write_text(
-        "#!/bin/sh\nexport CODEX_MATRIX_RAIN=1\n"
-        'exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/codex" '
-        '-c \'model="gpt-6.1-sol"\' -c \'model_reasoning_effort="ultra"\' "$@"\n'
-    )
-    wrapper.chmod(0o755)
     for relative, mode in helper_modes.items():
         if (package / relative).stat().st_mode & 0o111 != mode:
             raise ValueError("Package helper executable mode changed")
-    for name in ("LICENSE", "NOTICE"):
-        shutil.copy2(ROOT / name, package / name)
-    smoke(wrapper, version)
     DIST.mkdir(parents=True, exist_ok=True)
     names = asset_names(version)
     output = DIST / names[0]
-    with tarfile.open(output, "w:gz") as tar:
-        tar.add(package, arcname=f"codex-matrix-{version}-{TARGET}")
-    (DIST / names[1]).write_text(f"{sha256(output)}  {names[0]}\n")
+    run(
+        sys.executable,
+        str(ROOT / "scripts/package-matrix-macos.py"),
+        "--package",
+        str(package),
+        "--output",
+        str(DIST),
+    )
     bundle = DIST / "source.bundle"
     if commit != base_commit:
         run("git", "bundle", "create", str(bundle), f"{base_commit}..HEAD")
@@ -344,7 +341,9 @@ def build():
     )
     (DIST / "release-notes.md").write_text(
         f"OpenAI Codex {version}에 Matrix 배경 효과를 적용한 macOS Apple Silicon 배포.\n\n"
-        "압축 해제 후 `bin/codex-matrix` 실행. 공식 helper 및 음성 리소스 포함.\n"
+        "압축 해제 후 `sh ./install.command`로 설치하거나 `bin/codex-matrix` 실행.\n"
+        f"설치 명령: `~/.codex/bin/codex-matrix-{version}`. Rust·Node.js·Python 불필요.\n"
+        "공식 helper 및 음성 리소스, 설치 안내, 라이선스 포함.\n"
         "네이티브 release 빌드, 버전 확인, ad hoc 서명 검증 완료. UI 테스트는 실행하지 않음.\n"
     )
     verification = work / "archive-verification"
@@ -423,6 +422,8 @@ def verify_dist(version):
         raise ValueError("Built source version mismatch")
     for path in (
         "scripts/matrix-release.py",
+        "scripts/package-matrix-macos.py",
+        "scripts/install-matrix-macos.sh",
         ".github/workflows",
         "matrix-baseline-version.txt",
     ):
