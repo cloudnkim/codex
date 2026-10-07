@@ -75,6 +75,7 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     pub(super) fn on_task_started(&mut self) {
+        self.bottom_pane.start_matrix_activity();
         self.bottom_pane.dismiss_composer_sparkle();
         self.clear_context_compaction();
         self.input_queue.user_turn_pending_start = false;
@@ -177,6 +178,11 @@ impl ChatWidget {
         self.clear_active_hook_cell();
         self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        if !from_replay {
+            self.bottom_pane.complete_matrix_activity();
+        } else {
+            self.bottom_pane.reset_matrix_activity();
+        }
         self.clear_safety_buffering();
         self.update_task_running_state();
         self.running_commands.clear();
@@ -553,6 +559,7 @@ impl ChatWidget {
             })
             .count();
         self.transcript.last_plan_progress = (total > 0).then_some((completed, total));
+        self.bottom_pane.set_matrix_plan_progress(completed, total);
         self.refresh_status_surfaces();
         self.add_to_history(history_cell::new_plan_update(update));
     }

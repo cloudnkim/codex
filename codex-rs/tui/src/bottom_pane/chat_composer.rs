@@ -197,6 +197,8 @@
 //! placeholder, effort ignition, and voice strip, and draws only in eligible blank cells without
 //! overwriting the placeholder or normal cursor. Hidden frames do not schedule animation redraws;
 //! motion settings, the starfield preference, and true-color support also gate the effect.
+//! Matrix mode adds an eleven-cell footer state driven only by live turn and plan events;
+//! passive footer visibility also controls its bounded redraw timer.
 //!
 //! # Large Paste Placeholders
 //!
@@ -344,6 +346,7 @@ use super::footer::single_line_footer_layout;
 use super::footer::status_line_right_indicator_line;
 use super::footer::toggle_shortcut_mode;
 use super::footer::uses_passive_footer_status_layout;
+use super::matrix_activity::MatrixActivity;
 use super::mentions_v2::MentionV2Popup;
 use super::mentions_v2::MentionV2Selection;
 use super::paste_burst::CharDecision;
@@ -607,6 +610,8 @@ pub(crate) struct ChatComposer {
     footer: FooterState,
     has_focus: bool,
     frame_requester: Option<FrameRequester>,
+    matrix_activity: MatrixActivity,
+    matrix_animation_enabled: bool,
     sparkle: sparkle::Sparkle,
     effort_tier: Option<EffortTier>,
     effort_animation_style: Option<IgnitionStyle>,
@@ -783,6 +788,8 @@ impl ChatComposer {
             },
             has_focus: has_input_focus,
             frame_requester: None,
+            matrix_activity: MatrixActivity::default(),
+            matrix_animation_enabled: false,
             sparkle: sparkle::Sparkle::default(),
             effort_tier: None,
             effort_animation_style: None,
@@ -4373,6 +4380,29 @@ impl ChatComposer {
 
     pub fn set_task_running(&mut self, running: bool) {
         self.is_task_running = running;
+        if !running {
+            self.matrix_activity.stop_unless_complete();
+        }
+    }
+
+    pub(crate) fn set_matrix_animation_enabled(&mut self, enabled: bool) {
+        self.matrix_animation_enabled = enabled;
+    }
+
+    pub(crate) fn start_matrix_activity(&mut self) {
+        self.matrix_activity.start();
+    }
+
+    pub(crate) fn complete_matrix_activity(&mut self) {
+        self.matrix_activity.complete();
+    }
+
+    pub(crate) fn reset_matrix_activity(&mut self) {
+        self.matrix_activity.stop();
+    }
+
+    pub(crate) fn set_matrix_plan_progress(&mut self, completed: usize, total: usize) {
+        self.matrix_activity.set_progress(completed, total);
     }
 
     pub(crate) fn set_queue_submissions(&mut self, queue_submissions: bool) {
@@ -4716,6 +4746,14 @@ impl ChatComposer {
                     } else {
                         None
                     };
+                    let matrix_now = std::time::Instant::now();
+                    let matrix_visible = status_line_active
+                        && combined_status_line
+                            .as_ref()
+                            .is_some_and(|line| line.width().min(12) + 13 <= available_width)
+                        && crate::matrix_rain::output_rain().is_some()
+                        && !self.footer.flash_visible()
+                        && self.footer.hint_override.is_none();
                     let transition_visible = status_line_active
                         && !self.footer.flash_visible()
                         && self.footer.hint_override.is_none();
@@ -4730,8 +4768,22 @@ impl ChatComposer {
                     {
                         transition.render_line(
                             combined_status_line.as_ref(),
-                            hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16),
+                            hint_rect
+                                .width
+                                .saturating_sub(FOOTER_INDENT_COLS as u16)
+                                .saturating_sub(if matrix_visible { 13 } else { 0 }),
                         )
+                    } else {
+                        combined_status_line
+                    };
+                    let combined_status_line = if matrix_visible {
+                        combined_status_line.map(|line| {
+                            self.matrix_activity.prefix_status_line(
+                                matrix_now,
+                                self.matrix_animation_enabled,
+                                line,
+                            )
+                        })
                     } else {
                         combined_status_line
                     };
@@ -4915,6 +4967,14 @@ impl ChatComposer {
                     {
                         frame_requester.schedule_frame_in(EFFORT_STATUS_LINE_FRAME_TICK);
                     }
+                    if matrix_visible
+                        && let Some(next_frame) = self
+                            .matrix_activity
+                            .next_frame_in(matrix_now, self.matrix_animation_enabled)
+                        && let Some(frame_requester) = &self.frame_requester
+                    {
+                        frame_requester.schedule_frame_in(next_frame);
+                    }
                 }
             }
         }
@@ -5081,6 +5141,55 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::app_event::AppEvent;
+
+    #[test]
+    fn matrix_activity_uses_plan_and_only_live_completion() {
+        let mut activity = MatrixActivity::default();
+        let now = std::time::Instant::now();
+        let cells = |activity: &MatrixActivity, at| {
+            activity
+                .line(at, false)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(cells(&activity, now), "CODEX READY");
+        activity.start();
+        assert_eq!(cells(&activity, now), "01AF7 01AF7");
+        assert_eq!(activity.next_frame_in(now, false), None);
+        assert_eq!(
+            activity.next_frame_in(now, true),
+            Some(super::super::matrix_activity::FRAME_TICK)
+        );
+        activity.set_progress(1, 2);
+        assert_eq!(cells(&activity, now), "CODEX 01AF7");
+        let prefixed = activity.prefix_status_line(now, false, Line::from("GPT-6"));
+        assert_eq!(prefixed.width(), 18);
+        let text = prefixed
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        insta::assert_snapshot!(text, @"CODEX 01AF7  GPT-6");
+        activity.stop_unless_complete();
+        assert_eq!(cells(&activity, now), "CODEX READY");
+        activity.start();
+        assert_eq!(cells(&activity, now), "01AF7 01AF7");
+        activity.set_progress(2, 2);
+        assert_eq!(cells(&activity, now), "CODEX ÉXIT7");
+        assert_eq!(activity.line(now, false).spans.len(), 11);
+        activity.complete();
+        assert_eq!(cells(&activity, now), "CODEX ÉXITO");
+        assert!(activity.next_frame_in(now, false).is_some());
+        activity.stop_unless_complete();
+        assert_eq!(cells(&activity, now), "CODEX ÉXITO");
+        let expired = now + std::time::Duration::from_secs(4);
+        assert_eq!(cells(&activity, expired), "CODEX READY");
+        assert_eq!(activity.next_frame_in(expired, false), None);
+        activity.stop();
+        assert_eq!(cells(&activity, now), "CODEX READY");
+    }
 
     use crate::bottom_pane::AppEventSender;
     use crate::bottom_pane::ChatComposer;
