@@ -134,6 +134,13 @@ impl App {
         };
         drop(bottom);
         let available = screen_size.height.saturating_sub(bottom_height);
+        let rain = (self.local_settings.tui.animations
+            && !dashboard_visible
+            && transcript_width > 0
+            && available > 0)
+            .then(crate::matrix_rain::output_rain)
+            .flatten();
+        view.mark_empty_output_cells(rain.is_some());
         let mut bottom_area = Rect::new(
             /*x*/ 0,
             screen_size.height.saturating_sub(bottom_height),
@@ -253,6 +260,22 @@ impl App {
             .filter(|_| chat_widget.no_modal_or_popup_active());
             feedback_tick =
                 view.render_composer_gap(follow_area, composer_hint.as_ref(), frame.buffer, now);
+            if let Some(rain) = rain {
+                let excluded = [
+                    follow_area.unwrap_or_default(),
+                    completion_tip_area.unwrap_or_default(),
+                ];
+                rain.render(
+                    Rect::new(
+                        /*x*/ 0,
+                        /*y*/ 0,
+                        transcript_width,
+                        transcript_bottom,
+                    ),
+                    frame.buffer,
+                    &excluded,
+                );
+            }
             chat_widget.note_rendered_width(screen_size.width);
             rendered_cursor = bottom.cursor_pos(bottom_area);
             if let Some(position) = rendered_cursor {
@@ -260,6 +283,10 @@ impl App {
                 frame.set_cursor_position(position);
             }
         })?;
+        if rain.is_some() && transcript_bottom > 0 {
+            tui.frame_requester()
+                .schedule_frame_in(crate::matrix_rain::FRAME_INTERVAL);
+        }
         if let Some((surface, tip)) = &turn_tip
             && tip.rendered.get()
         {
