@@ -307,7 +307,9 @@ def build():
     run("codesign", "--verify", "--strict", str(package / "bin/codex"))
     wrapper = package / "bin/codex-matrix"
     wrapper.write_text(
-        '#!/bin/sh\nexport CODEX_MATRIX_RAIN=1\nexec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/codex" "$@"\n'
+        "#!/bin/sh\nexport CODEX_MATRIX_RAIN=1\n"
+        'exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/codex" '
+        '-c \'model="gpt-6.1-sol"\' -c \'model_reasoning_effort="ultra"\' "$@"\n'
     )
     wrapper.chmod(0o755)
     for relative, mode in helper_modes.items():

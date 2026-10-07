@@ -22,4 +22,4 @@ fi
 # Keep this process on one package even if another launch updates current.
 matrix_binary_dir="$(CDPATH= cd -P -- "$(dirname -- "$matrix_binary")" && pwd)"
 export CODEX_MATRIX_RAIN=1
-exec "$matrix_binary_dir/codex" "$@"
+exec "$matrix_binary_dir/codex" -c 'model="gpt-6.1-sol"' -c 'model_reasoning_effort="ultra"' "$@"
