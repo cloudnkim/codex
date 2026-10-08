@@ -16,6 +16,7 @@ mod logical;
 mod tabs;
 
 use ratatui::buffer::Buffer;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Alignment;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -290,10 +291,37 @@ impl TextLayout {
         for (screen_row, row) in self.visible_rows(area, start_row) {
             let mut row_area =
                 Rect::new(area.x, area.y + screen_row, area.width, /*height*/ 1);
+            let marked = row_area.width > 0
+                && buf
+                    .cell((row_area.x, row_area.y))
+                    .is_some_and(|cell| cell.symbol() == crate::matrix_rain::EMPTY_OUTPUT_CELL);
             buf.set_style(row_area, row.line.line.style);
             row_area.width = row.content_width;
             HyperlinkParagraph::new(std::slice::from_ref(&row.line), row.line.line.style)
                 .render(row_area, buf);
+            if marked {
+                // HyperlinkParagraph advances by the width of a wide glyph without writing its
+                // continuation cell. Clear only the untouched marker; keep the lead cell intact.
+                let mut x = row_area.left();
+                while x < row_area.right() {
+                    let Some(cell) = buf.cell((x, row_area.y)) else {
+                        break;
+                    };
+                    let width = cell.cell_width().max(1);
+                    if cell.symbol() != crate::matrix_rain::EMPTY_OUTPUT_CELL && width > 1 {
+                        for continuation in
+                            x.saturating_add(1)..x.saturating_add(width).min(row_area.right())
+                        {
+                            if let Some(cell) = buf.cell_mut((continuation, row_area.y))
+                                && cell.symbol() == crate::matrix_rain::EMPTY_OUTPUT_CELL
+                            {
+                                cell.set_symbol(" ");
+                            }
+                        }
+                    }
+                    x = x.saturating_add(width);
+                }
+            }
         }
     }
 

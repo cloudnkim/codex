@@ -117,6 +117,7 @@ pub(crate) struct TranscriptView {
     last_tail: Option<EntryKey>,
     last_click: Option<(std::time::Instant, u16, u16, u8)>,
     disclosure: disclosure::Disclosure,
+    mark_empty_output_cells: bool,
 }
 
 impl Default for TranscriptView {
@@ -153,11 +154,16 @@ impl Default for TranscriptView {
             last_tail: None,
             last_click: None,
             disclosure: disclosure::Disclosure::default(),
+            mark_empty_output_cells: false,
         }
     }
 }
 
 impl TranscriptView {
+    pub(crate) fn mark_empty_output_cells(&mut self, enabled: bool) {
+        self.mark_empty_output_cells = enabled;
+    }
+
     /// Rows left after the last render, including all startup notices and live entries.
     /// Callers can paint temporary UI here without changing selection or saved history.
     pub(crate) fn remaining_area(&self) -> Rect {
@@ -182,6 +188,17 @@ impl TranscriptView {
         Clear.render(area, buf);
         let previous_height = self.area.height;
         let resized = self.area.width != area.width || self.area.bottom() != area.bottom();
+        if self.mark_empty_output_cells {
+            // Text rendering replaces these symbols, including literal spaces and wide-glyph
+            // continuation cells. The owned frame consumes every survivor before flushing.
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_symbol(crate::matrix_rain::EMPTY_OUTPUT_CELL);
+                    }
+                }
+            }
+        }
         self.prepare_width(area.width);
         self.area = area;
         self.normalize_selection(cells);

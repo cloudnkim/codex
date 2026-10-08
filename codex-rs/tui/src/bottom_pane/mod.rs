@@ -77,6 +77,7 @@ mod approval_overlay;
 mod async_questions;
 mod empty_state_policy;
 mod hook_status;
+mod matrix_activity;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 pub(crate) use multi_select_picker::MultiSelectItem;
@@ -370,6 +371,7 @@ impl BottomPane {
             composer_config,
         );
         composer.set_frame_requester(frame_requester.clone());
+        composer.set_matrix_animation_enabled(animations_enabled && effects.progress);
         let keymap = RuntimeKeymap::defaults();
         composer.set_keymap_bindings(&keymap);
         composer.set_skill_mentions(skills);
@@ -1348,6 +1350,22 @@ impl BottomPane {
             // Hide the status indicator when a task completes, but keep other modal views.
             self.hide_status_indicator();
         }
+    }
+
+    pub(crate) fn start_matrix_activity(&mut self) {
+        self.composer.start_matrix_activity();
+    }
+
+    pub(crate) fn complete_matrix_activity(&mut self) {
+        self.composer.complete_matrix_activity();
+    }
+
+    pub(crate) fn reset_matrix_activity(&mut self) {
+        self.composer.reset_matrix_activity();
+    }
+
+    pub(crate) fn set_matrix_plan_progress(&mut self, completed: usize, total: usize) {
+        self.composer.set_matrix_plan_progress(completed, total);
     }
 
     pub(crate) fn set_queue_submissions(&mut self, queue_submissions: bool) {
