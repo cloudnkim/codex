@@ -27,6 +27,10 @@ impl ChatWidget {
         self.bottom_pane.copy_composer_selection(event, copy)
     }
 
+    pub(crate) fn handle_git_graph_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
+        !self.external_writer_view && self.bottom_pane.handle_git_graph_mouse(event)
+    }
+
     pub(crate) fn handle_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
         self.bottom_pane.handle_composer_mouse(event)
     }

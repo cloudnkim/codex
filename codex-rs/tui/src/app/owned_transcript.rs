@@ -409,6 +409,9 @@ impl App {
                 let size = tui.prepare_draw_size()?;
                 self.render_owned_transcript(tui, size)?;
             }
+            if self.chat_widget.handle_git_graph_mouse(*mouse) {
+                return Ok(true);
+            }
             if self.chat_widget.no_modal_or_popup_active()
                 && self
                     .chat_widget

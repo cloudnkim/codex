@@ -1147,7 +1147,11 @@ impl App {
                         self.app_event_tx.send(AppEvent::LaunchExternalEditor);
                     }
                 }
-                TuiEvent::Mouse(mouse) => self.start_right_click_paste(tui, mouse),
+                TuiEvent::Mouse(mouse) => {
+                    if !self.chat_widget.handle_git_graph_mouse(mouse) {
+                        self.start_right_click_paste(tui, mouse);
+                    }
+                }
                 TuiEvent::FocusLost => {}
             }
         }

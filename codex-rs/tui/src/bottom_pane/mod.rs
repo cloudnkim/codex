@@ -149,6 +149,7 @@ mod effort_status_line;
 mod experimental_features_view;
 mod file_search_popup;
 mod footer;
+mod git_graph;
 mod list_selection_view;
 mod memories_settings_view;
 mod mentions_v2;
@@ -286,6 +287,7 @@ pub(crate) struct BottomPane {
     /// Composer is retained even when a BottomPaneView is displayed so the
     /// input state is retained when the view is closed.
     composer: ChatComposer,
+    git_graph: git_graph::GitGraphPanel,
 
     /// Stack of views displayed instead of the composer (e.g. popups/modals).
     view_stack: Vec<Box<dyn BottomPaneView>>,
@@ -376,6 +378,7 @@ impl BottomPane {
         composer.set_keymap_bindings(&keymap);
         composer.set_skill_mentions(skills);
         Self {
+            git_graph: git_graph::GitGraphPanel::new(frame_requester.clone()),
             composer,
             view_stack: Vec::new(),
             warnings_view: None,
@@ -404,6 +407,24 @@ impl BottomPane {
             context_window_used_tokens: None,
             keymap,
         }
+    }
+
+    pub(crate) fn sync_git_graph(
+        &mut self,
+        cwd: &std::path::Path,
+        runner: Option<crate::workspace_command::WorkspaceCommandRunner>,
+        enabled: bool,
+    ) {
+        self.git_graph
+            .sync(cwd, runner, enabled && self.no_modal_or_popup_active());
+    }
+
+    pub(crate) fn handle_git_graph_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
+        if !self.no_modal_or_popup_active() {
+            self.git_graph.hide();
+            return false;
+        }
+        self.git_graph.mouse(event)
     }
 
     pub fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
@@ -2228,6 +2249,9 @@ impl BottomPane {
         mut options: ComposerRenderOptions<'a>,
         views: &'a [Box<dyn BottomPaneView>],
     ) -> RenderableItem<'a> {
+        if !self.no_modal_or_popup_active() || !views.is_empty() {
+            self.git_graph.hide();
+        }
         if self.warnings_active()
             && let Some(warnings) = &self.warnings_view
         {
@@ -2375,6 +2399,10 @@ impl BottomPane {
                 }))
             };
             flex2.push(/*flex*/ 0, composer);
+            if question_editor.is_none() && self.no_modal_or_popup_active() {
+                // Composer gets its space first, so short terminals clip the graph.
+                flex2.push(/*flex*/ 1, RenderableItem::Borrowed(&self.git_graph));
+            }
             RenderableItem::Owned(Box::new(flex2))
         }
     }
