@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -151,6 +152,86 @@ def asset_names(version):
     return [archive, archive + ".sha256"]
 
 
+def resolve_workspace_version(version, upstream):
+    """Resolve exactly one canonical workspace version hunk; reject all other shapes."""
+    path = "codex-rs/Cargo.toml"
+    manifest = ROOT / path
+    text = manifest.read_text()
+    match = re.search(
+        r'^<<<<<<< [^\n]+\n(?P<ours>version = "(?P<old>[0-9.]+)"\n)'
+        r'=======\n(?P<theirs>version = "(?P<new>[0-9.]+)"\n)'
+        r'>>>>>>> [^\n]+(?:\n|$)', text, re.MULTILINE,
+    )
+    if not match or len(re.findall(r"^(?:<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|)", text, re.MULTILINE)) != 3:
+        raise ValueError("Cargo conflict is not a single workspace version line")
+    headers = re.findall(r"^\[[^\n]+\]\s*$", text[:match.start()], re.MULTILINE)
+    if not headers or headers[-1].strip() != "[workspace.package]":
+        raise ValueError("Cargo version conflict is outside workspace.package")
+    version_tuple(match["old"])
+    version_tuple(version)
+    ours = tomllib.loads(run("git", "show", f":2:{path}"))
+    theirs_text = run("git", "show", f":3:{path}")
+    theirs = tomllib.loads(theirs_text)
+    if (match["old"] != ours["workspace"]["package"]["version"]
+        or match["new"] != version
+        or theirs["workspace"]["package"]["version"] != version
+        or theirs_text != run("git", "show", f"{upstream}:{path}")):
+        raise ValueError("Cargo conflict does not match the requested upstream version")
+    resolved = text[:match.start()] + match["theirs"] + text[match.end():]
+    if tomllib.loads(resolved)["workspace"]["package"]["version"] != version:
+        raise ValueError("Resolved workspace version mismatch")
+    manifest.write_text(resolved)
+    run("git", "add", "--", path)
+
+
+def sync_workspace_lock(version):
+    """Update inherited local package versions without resolving registry dependencies."""
+    workspace_root = ROOT / "codex-rs"
+    workspace = tomllib.loads((workspace_root / "Cargo.toml").read_text())["workspace"]
+    if workspace["package"]["version"] != version:
+        raise ValueError("Workspace version does not match release target")
+    inherited = set()
+    excluded = {path.resolve() for pattern in workspace.get("exclude", []) for path in workspace_root.glob(pattern)}
+    for pattern in workspace.get("members", []):
+        for member in workspace_root.glob(pattern):
+            if member.resolve() in excluded:
+                continue
+            if not member.resolve().is_relative_to(workspace_root.resolve()):
+                raise ValueError("Workspace member escapes workspace directory")
+            package = tomllib.loads((member / "Cargo.toml").read_text()).get("package", {})
+            if package.get("version") == {"workspace": True}:
+                inherited.add(package["name"])
+    lock = workspace_root / "Cargo.lock"
+    text = lock.read_text()
+    expected = tomllib.loads(text)
+    replacements = {}
+    for package in expected.get("package", []):
+        if "source" not in package and package["name"] in inherited:
+            old = package["version"]
+            if old != version:
+                replacements[f'{package["name"]} {old}'] = f'{package["name"]} {version}'
+                package["version"] = version
+    for package in expected.get("package", []):
+        if "dependencies" in package:
+            package["dependencies"] = [replacements.get(dep, dep) for dep in package["dependencies"]]
+    chunks = re.split(r"(?m)(?=^\[\[package\]\]$)", text)
+    for index, chunk in enumerate(chunks):
+        if not chunk.startswith("[[package]]"):
+            continue
+        package = tomllib.loads(chunk)["package"][0]
+        if "source" not in package and package["name"] in inherited:
+            chunk = re.sub(r'^version = "[^"\n]+"$', f'version = "{version}"', chunk, count=1, flags=re.MULTILINE)
+        for old, new in replacements.items():
+            chunk = chunk.replace(f'"{old}"', f'"{new}"')
+        chunks[index] = chunk
+    resolved = "".join(chunks)
+    if tomllib.loads(resolved) != expected:
+        raise ValueError("Lockfile update changed unrelated dependency data")
+    if resolved != text:
+        lock.write_text(resolved)
+        run("git", "add", "--", "codex-rs/Cargo.lock")
+
+
 def prepare_source(version, base):
     if run("git", "status", "--porcelain", "--untracked-files=no"):
         raise ValueError("Build requires a clean tracked checkout")
@@ -184,14 +265,20 @@ def prepare_source(version, base):
                 "--no-commit",
                 upstream,
             )
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as error:
+            if error.output:
+                print(error.output, file=sys.stderr, end="" if error.output.endswith("\n") else "\n")
             conflicts = run(
                 "git", "diff", "--name-only", "--diff-filter=U"
             ).splitlines()
+            print("Conflicting paths: " + (", ".join(conflicts) or "(none)"), file=sys.stderr)
             if not conflicts or any(
-                not path.startswith(".github/workflows/") for path in conflicts
+                path != "codex-rs/Cargo.toml" and not path.startswith(".github/workflows/")
+                for path in conflicts
             ):
                 raise
+            if "codex-rs/Cargo.toml" in conflicts:
+                resolve_workspace_version(version, upstream)
         # Keep only the fork's automation, including after workflow-only conflicts.
         run(
             "git",
@@ -208,6 +295,7 @@ def prepare_source(version, base):
             raise ValueError("Expected a pending official upstream merge")
         if any(sha256(ROOT / path) != digest for path, digest in digests.items()):
             raise ValueError("Upstream merge changed release automation or baseline")
+        sync_workspace_lock(version)
         (ROOT / "matrix-upstream-version.txt").write_text(version + "\n")
         run("git", "add", "--", "matrix-upstream-version.txt")
         run(
