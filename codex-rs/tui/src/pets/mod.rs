@@ -19,7 +19,7 @@ mod ambient;
 mod asset_pack;
 mod catalog;
 mod frames;
-mod image_protocol;
+pub(crate) mod image_protocol;
 mod model;
 mod picker;
 mod preview;

@@ -355,6 +355,38 @@ impl Renderable for GitGraphPanel {
                 .branch
                 .starts_with("refs/")
                 .then_some(self.branch.as_str());
+            let rows = usize::from(height).min(self.lines.len().saturating_sub(offset));
+            let main_width = if body.width >= 64 {
+                body.width - 32
+            } else {
+                body.width
+            };
+            let columns = self
+                .lines
+                .iter()
+                .map(|row| row.lanes.trim_end().chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(usize::from(main_width));
+            let neighbors = (0..rows + 2)
+                .map(|index| {
+                    offset
+                        .checked_add(index)
+                        .and_then(|index| index.checked_sub(1))
+                        .and_then(|index| self.lines.get(index))
+                })
+                .collect::<Vec<_>>();
+            let pixels = crate::git_graph_image::submit(
+                neighbors
+                    .iter()
+                    .map(|row| row.map(|row| row.lanes.clone()).unwrap_or_default())
+                    .collect(),
+                neighbors
+                    .iter()
+                    .map(|row| row.is_some_and(|row| row.head))
+                    .collect(),
+                Rect::new(body.x, body.y, columns as u16, rows as u16),
+            );
             for (index, row) in self
                 .lines
                 .iter()
@@ -362,11 +394,12 @@ impl Renderable for GitGraphPanel {
                 .take(usize::from(height))
                 .enumerate()
             {
-                row.render(
+                row.render_pixels(
                     Rect::new(body.x, body.y + index as u16, body.width, 1),
                     buf,
                     author_width,
                     selected,
+                    pixels,
                 );
             }
         }
@@ -388,7 +421,12 @@ struct GraphRow {
 }
 
 impl GraphRow {
+    #[cfg(test)]
     fn main_line(&self, author_width: usize) -> Line<'static> {
+        self.main_line_pixels(author_width, false)
+    }
+
+    fn main_line_pixels(&self, author_width: usize, pixels: bool) -> Line<'static> {
         let lanes = if self.hash.is_some() {
             format!("{}    ", self.lanes.trim_end())
         } else {
@@ -405,7 +443,14 @@ impl GraphRow {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
                 }
-                Span::styled(c.to_string(), style)
+                Span::styled(
+                    if pixels {
+                        " ".to_owned()
+                    } else {
+                        c.to_string()
+                    },
+                    if pixels { Style::default() } else { style },
+                )
             })
             .collect::<Vec<_>>();
         let style = if self.head {
@@ -420,7 +465,7 @@ impl GraphRow {
                 let padding = " ".repeat(author_width.saturating_sub(author.width()));
                 spans.push(Span::styled(
                     format!(" {author}{padding}"),
-                    style.fg(Color::DarkGray),
+                    style.fg(Color::Rgb(135, 255, 215)),
                 ));
             }
             if !self.subject.is_empty() {
@@ -472,13 +517,25 @@ impl GraphRow {
         format!("{prefix}[{}]{suffix}", middle_truncate(first, available))
     }
 
+    #[cfg(test)]
     fn render(&self, area: Rect, buf: &mut Buffer, author_width: usize, selected: Option<&str>) {
+        self.render_pixels(area, buf, author_width, selected, false);
+    }
+
+    fn render_pixels(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        author_width: usize,
+        selected: Option<&str>,
+        pixels: bool,
+    ) {
         let (main_width, badge_width) = if area.width >= 64 {
             (area.width - 32, 30)
         } else {
             (area.width, 0)
         };
-        Paragraph::new(self.main_line(author_width))
+        Paragraph::new(self.main_line_pixels(author_width, pixels))
             .render(Rect::new(area.x, area.y, main_width, 1), buf);
         if badge_width > 0 {
             let mut style = Style::default().fg(Color::Green);

@@ -122,6 +122,7 @@ fn should_emit_notification(condition: NotificationCondition, terminal_focused: 
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        let _ = crate::git_graph_image::clear(self.terminal.backend_mut());
         if let Err(err) = self.clear_ambient_pet_image() {
             tracing::debug!(error = %err, "failed to clear ambient pet image on TUI drop");
         }
@@ -330,6 +331,9 @@ fn restore_common(
     handoff: TerminalHandoff,
 ) -> Result<()> {
     let mut first_error = ensure_virtual_terminal_processing().err();
+    if let Err(err) = crate::git_graph_image::clear(&mut stdout()) {
+        first_error.get_or_insert(err);
+    }
 
     let screen_result = match handoff {
         TerminalHandoff::KeepScreen if ALTERNATE_SCREEN.is_active() => {
@@ -662,6 +666,7 @@ pub struct Tui {
     pending_history_lines: Vec<PendingHistoryLines>,
     clear_thread_switch_on_draw: bool,
     screen_size: ScreenSizePolicy,
+    git_graph_image: crate::git_graph_image::Renderer,
     ambient_pet_image_state: crate::pets::PetImageRenderState,
     pet_picker_preview_image_state: crate::pets::PetImageRenderState,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
@@ -739,6 +744,7 @@ impl Tui {
             pending_history_lines: vec![],
             clear_thread_switch_on_draw: false,
             screen_size: ScreenSizePolicy::default(),
+            git_graph_image: crate::git_graph_image::Renderer::default(),
             ambient_pet_image_state: crate::pets::PetImageRenderState::default(),
             pet_picker_preview_image_state: crate::pets::PetImageRenderState::default(),
             alt_saved_viewport: None,
@@ -1050,6 +1056,7 @@ impl Tui {
     /// Enter alternate screen and expand the viewport to full terminal size, saving the current
     /// inline viewport for restoration when leaving.
     pub fn enter_alt_screen(&mut self) -> Result<()> {
+        crate::git_graph_image::clear(self.terminal.backend_mut())?;
         if self.is_alt_screen_active() {
             return Ok(());
         }
@@ -1101,6 +1108,7 @@ impl Tui {
 
     /// Close an overlay, preserving the alternate screen when the session owns it.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
+        crate::git_graph_image::clear(self.terminal.backend_mut())?;
         let input_result = self.set_overlay_input(OverlayInput::Default);
         if self.is_owned_screen() {
             self.terminal.invalidate_viewport();
@@ -1284,6 +1292,7 @@ impl Tui {
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
+            let _graph_frame = self.git_graph_image.begin(self.terminal.backend_mut())?;
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 self.terminal.invalidate_cursor_state();
@@ -1351,9 +1360,13 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
-            terminal.draw_with_size(screen_size, |frame| {
+            let result = terminal.draw_with_size(screen_size, |frame| {
                 draw_fn(frame);
-            })
+            });
+            if result.is_ok() {
+                self.git_graph_image.end(terminal.backend_mut())?;
+            }
+            result
         })??;
         Ok(())
     }
@@ -1435,6 +1448,7 @@ impl Tui {
         ensure_virtual_terminal_processing()?;
 
         stdout().sync_update(|_| {
+            let _graph_frame = self.git_graph_image.begin(self.terminal.backend_mut())?;
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 self.terminal.invalidate_cursor_state();
@@ -1489,9 +1503,13 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
-            terminal.draw_with_size(screen_size, |frame| {
+            let result = terminal.draw_with_size(screen_size, |frame| {
                 draw_fn(frame);
-            })
+            });
+            if result.is_ok() {
+                self.git_graph_image.end(terminal.backend_mut())?;
+            }
+            result
         })??;
         Ok(())
     }

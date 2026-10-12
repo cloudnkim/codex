@@ -130,6 +130,7 @@ mod copy_input_guard;
 pub(crate) mod custom_terminal;
 mod daybreak;
 mod experimental_features;
+mod git_graph_image;
 mod markdown_copy;
 mod matrix_rain;
 mod permission_discovery;
