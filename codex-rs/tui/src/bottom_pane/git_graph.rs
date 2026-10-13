@@ -1,4 +1,4 @@
-//! Cached workspace Git graph. Rendering never runs Git; explicit clicks alone fetch remotes.
+//! Cached workspace Git graph. Only explicit clicks fetch remotes or update the checkout.
 use std::cell::Cell;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,6 +30,8 @@ use crate::workspace_command::WorkspaceCommand;
 use crate::workspace_command::WorkspaceCommandRunner;
 
 const POLL: Duration = Duration::from_secs(3);
+const DEFAULT_ROWS: u16 = 10;
+const MIN_ROWS: u16 = 3;
 const PALETTE: [Color; 6] = [
     Color::Indexed(81),
     Color::Indexed(114),
@@ -39,12 +41,42 @@ const PALETTE: [Color; 6] = [
     Color::Indexed(117),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitAction {
+    Fetch,
+    Update,
+}
+
+impl GitAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Update => "update",
+        }
+    }
+
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Fetch => &["fetch", "--all"],
+            // Respect the current branch's upstream; never create a merge, rebase, or stash.
+            Self::Update => &["pull", "--ff-only", "--no-rebase", "--no-autostash"],
+        }
+    }
+}
+
 struct Snapshot {
     fingerprint: String,
     branch: String,
     refs: Vec<String>,
     lines: Option<Vec<GraphRow>>,
-    fetch_error: Option<String>,
+    action_status: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeDrag {
+    start_row: u16,
+    rows: u16,
+    max_rows: u16,
 }
 
 pub(super) struct GitGraphPanel {
@@ -60,13 +92,16 @@ pub(super) struct GitGraphPanel {
     lines: Vec<GraphRow>,
     selected: Option<String>,
     error: Option<String>,
+    action_status: Option<String>,
     enabled: bool,
     collapsed: bool,
     picker: bool,
     scroll: Cell<usize>,
     picker_scroll: Cell<usize>,
     area: Cell<Rect>,
-    fetching: bool,
+    visible_rows: u16,
+    resize_drag: Cell<Option<ResizeDrag>>,
+    action: Option<GitAction>,
 }
 
 impl GitGraphPanel {
@@ -84,13 +119,16 @@ impl GitGraphPanel {
             lines: Vec::new(),
             selected: None,
             error: None,
+            action_status: None,
             enabled: false,
             collapsed: false,
             picker: false,
             scroll: Cell::new(0),
             picker_scroll: Cell::new(0),
             area: Cell::new(Rect::default()),
-            fetching: false,
+            visible_rows: DEFAULT_ROWS,
+            resize_drag: Cell::new(None),
+            action: None,
         }
     }
 
@@ -99,11 +137,12 @@ impl GitGraphPanel {
             task.abort();
         }
         self.result = None;
-        self.fetching = false;
+        self.action = None;
     }
 
     pub(super) fn hide(&self) {
         self.area.set(Rect::default());
+        self.resize_drag.set(None);
     }
 
     pub(super) fn sync(
@@ -127,6 +166,7 @@ impl GitGraphPanel {
             self.fingerprint.clear();
             self.selected = None;
             self.error = None;
+            self.action_status = None;
             self.picker = false;
             self.scroll.set(0);
             self.picker_scroll.set(0);
@@ -143,8 +183,7 @@ impl GitGraphPanel {
                 Ok(result) => {
                     self.result = None;
                     self.task = None;
-                    let fetching = self.fetching;
-                    self.fetching = false;
+                    self.action = None;
                     match result {
                         Ok(Some(snapshot)) => {
                             self.fingerprint = snapshot.fingerprint;
@@ -153,14 +192,9 @@ impl GitGraphPanel {
                             if let Some(lines) = snapshot.lines {
                                 self.lines = lines;
                             }
-                            if fetching
-                                || snapshot.fetch_error.is_some()
-                                || self
-                                    .error
-                                    .as_ref()
-                                    .is_none_or(|error| !error.starts_with("fetch:"))
-                            {
-                                self.error = snapshot.fetch_error;
+                            self.error = None;
+                            if snapshot.action_status.is_some() {
+                                self.action_status = snapshot.action_status;
                             }
                             if self
                                 .selected
@@ -191,19 +225,25 @@ impl GitGraphPanel {
             }
         }
         if self.result.is_none() && Instant::now() >= self.next_poll {
-            self.start(false);
+            self.start(None);
         }
     }
 
-    fn start(&mut self, fetch: bool) {
+    fn start(&mut self, action: Option<GitAction>) {
         let Some(runner) = self.runner.clone() else {
             return;
         };
-        if fetch && !self.fetching {
+        if action.is_some() && self.action.is_none() {
             self.cancel();
         }
         if self.result.is_some() {
             return;
+        }
+        if action == Some(GitAction::Update) {
+            // Updating always targets the checkout, not a branch selected for inspection.
+            self.selected = None;
+            self.picker = false;
+            self.scroll.set(0);
         }
         let cwd = self.cwd.clone();
         let selected = self.selected.clone();
@@ -211,26 +251,77 @@ impl GitGraphPanel {
         let frame = self.frame.clone();
         let (tx, rx) = oneshot::channel();
         self.result = Some(rx);
-        self.fetching = fetch;
+        self.action = action;
+        if action.is_some() {
+            self.action_status = None;
+            self.error = None;
+        }
         self.task = Some(tokio::spawn(async move {
-            let result = read_snapshot(runner, cwd, selected, fingerprint, fetch).await;
+            let result = read_snapshot(runner, cwd, selected, fingerprint, action).await;
             let _ = tx.send(result);
             frame.schedule_frame();
         }));
     }
 
+    fn status(&self) -> Option<(&str, &str, Color)> {
+        match self.action {
+            Some(GitAction::Fetch) => Some(("RUNNING", "fetching…", Color::Yellow)),
+            Some(GitAction::Update) => Some(("RUNNING", "updating HEAD…", Color::Yellow)),
+            None => {
+                if let Some(error) = self.error.as_deref() {
+                    Some(("ERROR", error, Color::Red))
+                } else {
+                    self.action_status.as_deref().map(|status| {
+                        if status.starts_with("fetch failed") || status.starts_with("update failed")
+                        {
+                            ("FAILED", status, Color::Red)
+                        } else {
+                            ("OK", status, Color::Green)
+                        }
+                    })
+                }
+            }
+        }
+    }
+
+    fn chrome_height(&self) -> u16 {
+        1 + u16::from(self.status().is_some())
+    }
+
     pub(super) fn mouse(&mut self, event: MouseEvent) -> bool {
         let area = self.area.get();
-        if !self.enabled
-            || area.is_empty()
-            || event.column < area.x
+        if !self.enabled || area.is_empty() {
+            self.resize_drag.set(None);
+            return false;
+        }
+        // Capture moves and release outside the panel as its top edge moves upward.
+        if let Some(drag) = self.resize_drag.get() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.visible_rows = (i32::from(drag.rows) + i32::from(drag.start_row)
+                        - i32::from(event.row))
+                    .clamp(i32::from(MIN_ROWS), i32::from(drag.max_rows))
+                        as u16;
+                    self.frame.schedule_frame();
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.resize_drag.set(None);
+                    return true;
+                }
+                MouseEventKind::Down(_) => self.resize_drag.set(None),
+                _ => return true,
+            }
+        }
+        if event.column < area.x
             || event.column >= area.right()
             || event.row < area.y
             || event.row >= area.bottom()
         {
             return false;
         }
-        let visible = usize::from(area.height.saturating_sub(1));
+        let chrome_height = self.chrome_height();
+        let visible = usize::from(area.height.saturating_sub(chrome_height));
         let (scroll, count) = if self.picker {
             (&self.picker_scroll, self.refs.len() + 1)
         } else {
@@ -250,11 +341,25 @@ impl GitGraphPanel {
                     self.picker = !self.picker;
                     self.collapsed = false;
                 } else if x < 22 {
-                    self.start(true);
+                    self.start(Some(GitAction::Fetch));
+                } else if x < 31 {
+                    self.start(Some(GitAction::Update));
+                } else if !self.collapsed {
+                    self.resize_drag.set(Some(ResizeDrag {
+                        start_row: event.row,
+                        // Start with the rendered size, including when the terminal clipped it.
+                        rows: area.height.saturating_sub(chrome_height),
+                        max_rows: area.bottom().saturating_sub(chrome_height).max(MIN_ROWS),
+                    }));
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) if self.picker && !self.fetching => {
-                let index = self.picker_scroll.get() + usize::from(event.row - area.y - 1);
+            MouseEventKind::Down(MouseButton::Left)
+                if self.picker
+                    && self.action.is_none()
+                    && event.row >= area.y.saturating_add(chrome_height) =>
+            {
+                let index =
+                    self.picker_scroll.get() + usize::from(event.row - area.y - chrome_height);
                 if index <= self.refs.len() {
                     self.selected = index
                         .checked_sub(1)
@@ -264,7 +369,7 @@ impl GitGraphPanel {
                     self.scroll.set(0);
                     self.fingerprint.clear();
                     self.cancel();
-                    self.start(false);
+                    self.start(None);
                 }
             }
             _ => {}
@@ -282,40 +387,47 @@ impl Drop for GitGraphPanel {
 
 impl Renderable for GitGraphPanel {
     fn desired_height(&self, _width: u16) -> u16 {
-        if !self.enabled || self.lines.is_empty() {
+        if !self.enabled || (self.lines.is_empty() && self.status().is_none()) {
             0
-        } else if self.collapsed {
-            1
+        } else if self.collapsed || self.lines.is_empty() {
+            self.chrome_height()
         } else {
-            8
+            self.visible_rows.saturating_add(self.chrome_height())
         }
     }
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.hide();
         if area.is_empty() || self.desired_height(area.width) == 0 {
+            self.hide();
             return;
         }
         self.area.set(area);
         // The label belongs to the displayed snapshot, not an in-flight selection.
         let branch = &self.branch;
-        let state = if self.fetching {
-            "fetching…"
-        } else {
-            self.error.as_deref().unwrap_or("")
-        };
         let header = format!(
-            "[{}] [branch]  [fetch] GitTree · {} {}",
+            "[{}] [branch]  [fetch] [update] ↕ GitTree · {}",
             if self.collapsed { "+" } else { "−" },
-            clean(branch),
-            clean(state)
+            clean(branch)
         );
         Paragraph::new(Line::styled(header, Style::default().fg(Color::Cyan)))
             .render(Rect::new(area.x, area.y, area.width, 1), buf);
-        let height = area.height.saturating_sub(1);
+        if let Some((label, message, color)) = self.status()
+            && area.height > 1
+        {
+            Paragraph::new(format!(" [{label}] {}", clean(message)))
+                .style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .render(Rect::new(area.x, area.y + 1, area.width, 1), buf);
+        }
+        let chrome_height = self.chrome_height();
+        let height = area.height.saturating_sub(chrome_height);
         if self.collapsed || height == 0 {
             return;
         }
-        let body = Rect::new(area.x, area.y + 1, area.width, height);
+        let body = Rect::new(area.x, area.y + chrome_height, area.width, height);
         if self.picker {
             let mut entries = vec![Line::raw("  Follow HEAD (current checkout)")];
             entries.extend(
@@ -394,13 +506,16 @@ impl Renderable for GitGraphPanel {
                 .take(usize::from(height))
                 .enumerate()
             {
-                row.render_pixels(
-                    Rect::new(body.x, body.y + index as u16, body.width, 1),
-                    buf,
-                    author_width,
-                    selected,
-                    pixels,
-                );
+                let row_area = Rect::new(body.x, body.y + index as u16, body.width, 1);
+                let background = if (offset + index) % 2 == 1 {
+                    crate::terminal_palette::default_bg()
+                        .map(crate::style::user_message_bg)
+                        .unwrap_or(Color::Rgb(40, 40, 40))
+                } else {
+                    Color::Reset
+                };
+                buf.set_style(row_area, Style::default().bg(background));
+                row.render_pixels(row_area, buf, author_width, selected, pixels);
             }
         }
     }
@@ -641,7 +756,7 @@ async fn read_snapshot(
     cwd: PathBuf,
     selected: Option<String>,
     previous: String,
-    fetch: bool,
+    action: Option<GitAction>,
 ) -> Result<Option<Snapshot>, String> {
     let command = |args: Vec<String>, timeout| {
         WorkspaceCommand::new(
@@ -655,25 +770,38 @@ async fn read_snapshot(
         .env("GCM_INTERACTIVE", "Never")
         .env("GIT_ASKPASS", "true")
         .env("SSH_ASKPASS", "true")
-        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+        // Preserve core.sshCommand and inherited SSH identity/proxy configuration.
+        .env("SSH_ASKPASS_REQUIRE", "force")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .timeout(timeout)
     };
     let args = |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
-    let mut fetch_error = None;
-    if fetch {
+    let mut action_status = None;
+    if let Some(action) = action {
+        let name = action.name();
         match runner
-            .run(command(args(&["fetch", "--all"]), Duration::from_secs(30)))
+            .run(command(args(action.args()), Duration::from_secs(120)))
             .await
         {
-            Ok(output) if output.success() => {}
+            Ok(output) if output.success() => action_status = Some(format!("{name}: complete")),
             Ok(output) => {
-                fetch_error = Some(format!(
-                    "fetch: {}",
-                    clean(output.stderr.lines().next().unwrap_or("failed"))
-                ))
+                let detail = output
+                    .stderr
+                    .lines()
+                    .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
+                    .or_else(|| {
+                        output
+                            .stderr
+                            .lines()
+                            .rev()
+                            .find(|line| !line.trim().is_empty())
+                    });
+                action_status = Some(match detail {
+                    Some(detail) => format!("{name} failed: {}", clean(detail)),
+                    None => format!("{name} failed (exit {})", output.exit_code),
+                });
             }
-            Err(error) => fetch_error = Some(format!("fetch: {error}")),
+            Err(error) => action_status = Some(format!("{name} failed: {error}")),
         }
     }
     let head = runner
@@ -729,7 +857,7 @@ async fn read_snapshot(
     let selected = selected.filter(|name| references.contains(name));
     let fingerprint = format!("{}{}{}{:?}", head.stdout, refs.stdout, branch, selected);
     // Tags affect decorations even though the picker contains branches only.
-    let lines = if fetch || fingerprint != previous {
+    let lines = if action.is_some() || fingerprint != previous {
         let mut log = args(&[
             "log",
             "--graph",
@@ -756,7 +884,7 @@ async fn read_snapshot(
         branch: selected.unwrap_or(branch),
         refs: references,
         lines,
-        fetch_error,
+        action_status,
     }))
 }
 
@@ -776,6 +904,331 @@ fn valid_ref(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drag_resizes_outside_panel_and_stops_on_release_or_hide() {
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.enabled = true;
+        panel.lines = vec![graph_line("*"); 30];
+        assert_eq!(panel.desired_height(80), 11);
+        let area = Rect::new(0, 20, 80, 11);
+        panel.render(area, &mut Buffer::empty(area));
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 20,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(panel.mouse(event));
+        event.kind = MouseEventKind::Drag(MouseButton::Left);
+        event.row = 15;
+        event.column = 90;
+        assert!(panel.mouse(event));
+        assert_eq!(panel.visible_rows, 15);
+        let enlarged = Rect::new(0, 15, 80, 16);
+        panel.render(enlarged, &mut Buffer::empty(enlarged));
+        assert!(panel.resize_drag.get().is_some());
+        event.row = 0;
+        assert!(panel.mouse(event));
+        assert_eq!(panel.visible_rows, 30);
+        event.row = 100;
+        assert!(panel.mouse(event));
+        assert_eq!(panel.visible_rows, MIN_ROWS);
+        event.kind = MouseEventKind::Up(MouseButton::Left);
+        assert!(panel.mouse(event));
+        assert!(panel.resize_drag.get().is_none());
+        event.kind = MouseEventKind::Drag(MouseButton::Left);
+        assert!(!panel.mouse(event));
+        assert_eq!(panel.visible_rows, MIN_ROWS);
+
+        event.kind = MouseEventKind::Down(MouseButton::Left);
+        event.column = 40;
+        event.row = enlarged.y;
+        assert!(panel.mouse(event));
+        panel.hide();
+        assert!(panel.resize_drag.get().is_none());
+        panel.collapsed = true;
+        assert_eq!(panel.desired_height(80), 1);
+        panel.collapsed = false;
+        assert_eq!(panel.desired_height(80), MIN_ROWS + 1);
+    }
+
+    #[test]
+    fn clipped_header_click_preserves_height_and_stripes_follow_scroll() {
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.enabled = true;
+        panel.lines = vec![graph_line("*\u{1f}abc123\u{1f}\u{1f}subject\u{1f}author"); 20];
+        let area = Rect::new(0, 20, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        panel.render(area, &mut buffer);
+        let stripe = buffer[(79, 22)].bg;
+        assert_ne!(stripe, Color::Reset);
+        assert_eq!(buffer[(79, 21)].bg, Color::Reset);
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 20,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        panel.mouse(event);
+        event.kind = MouseEventKind::Up(MouseButton::Left);
+        panel.mouse(event);
+        assert_eq!(panel.visible_rows, DEFAULT_ROWS);
+        panel.scroll.set(1);
+        panel.render(area, &mut buffer);
+        assert_eq!(buffer[(79, 21)].bg, stripe);
+        assert_eq!(buffer[(79, 22)].bg, Color::Reset);
+    }
+
+    #[tokio::test]
+    async fn actions_preserve_ssh_configuration_and_report_success_or_failure() {
+        use crate::workspace_command::WorkspaceCommandError;
+        use crate::workspace_command::WorkspaceCommandExecutor;
+        use crate::workspace_command::WorkspaceCommandOutput;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct Runner {
+            action_exit: i32,
+        }
+        impl WorkspaceCommandExecutor for Runner {
+            fn run(
+                &self,
+                command: WorkspaceCommand,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<WorkspaceCommandOutput, WorkspaceCommandError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                assert!(!command.env.contains_key("GIT_SSH_COMMAND"));
+                let (exit_code, stdout, stderr) = match command.argv[4].as_str() {
+                    "fetch" => {
+                        assert_eq!(&command.argv[4..], &["fetch", "--all"]);
+                        assert_eq!(command.timeout, Duration::from_secs(120));
+                        (self.action_exit, "", "remote: progress\nfatal: denied\n")
+                    }
+                    "pull" => {
+                        assert_eq!(
+                            &command.argv[4..],
+                            &["pull", "--ff-only", "--no-rebase", "--no-autostash"]
+                        );
+                        assert_eq!(command.timeout, Duration::from_secs(120));
+                        (self.action_exit, "", "remote: progress\nfatal: denied\n")
+                    }
+                    "rev-parse" => (0, "abc123\n", ""),
+                    "for-each-ref" => (0, "refs/heads/main\tabc123\n", ""),
+                    "symbolic-ref" => (0, "main\n", ""),
+                    "log" => (
+                        0,
+                        "*\u{1f}abc123\u{1f}HEAD -> main\u{1f}subject\u{1f}author",
+                        "",
+                    ),
+                    other => panic!("unexpected command: {other}"),
+                };
+                Box::pin(async move {
+                    Ok(WorkspaceCommandOutput {
+                        exit_code,
+                        stdout: stdout.into(),
+                        stderr: stderr.into(),
+                    })
+                })
+            }
+        }
+
+        for (action, action_exit, expected) in [
+            (GitAction::Fetch, 0, "fetch: complete"),
+            (GitAction::Fetch, 128, "fetch failed: fatal: denied"),
+            (GitAction::Update, 0, "update: complete"),
+            (GitAction::Update, 128, "update failed: fatal: denied"),
+        ] {
+            let snapshot = read_snapshot(
+                Arc::new(Runner { action_exit }),
+                PathBuf::from("/workspace"),
+                None,
+                String::new(),
+                Some(action),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(snapshot.action_status.as_deref(), Some(expected));
+            assert_eq!(snapshot.lines.unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn action_status_has_a_separate_colored_row_even_when_collapsed() {
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.enabled = true;
+        panel.branch = "a-very-long-branch-name-that-fills-the-header".into();
+        panel.lines = vec![graph_line("*")];
+        let area = Rect::new(0, 0, 48, 2);
+        for (action, status, error, expected, color) in [
+            (
+                Some(GitAction::Fetch),
+                None,
+                None,
+                "[RUNNING] fetching…",
+                Color::Yellow,
+            ),
+            (
+                Some(GitAction::Update),
+                None,
+                None,
+                "[RUNNING] updating HEAD…",
+                Color::Yellow,
+            ),
+            (
+                None,
+                Some("fetch: complete"),
+                None,
+                "[OK] fetch: complete",
+                Color::Green,
+            ),
+            (
+                None,
+                Some("update: complete"),
+                None,
+                "[OK] update: complete",
+                Color::Green,
+            ),
+            (
+                None,
+                Some("fetch failed: denied"),
+                None,
+                "[FAILED] fetch failed: denied",
+                Color::Red,
+            ),
+            (
+                None,
+                Some("update failed: denied"),
+                None,
+                "[FAILED] update failed: denied",
+                Color::Red,
+            ),
+            (
+                None,
+                Some("fetch failed (exit 128)"),
+                None,
+                "[FAILED] fetch failed (exit 128)",
+                Color::Red,
+            ),
+            (
+                None,
+                Some("fetch: complete"),
+                Some("connection lost"),
+                "[ERROR] connection lost",
+                Color::Red,
+            ),
+        ] {
+            panel.action = action;
+            panel.action_status = status.map(str::to_owned);
+            panel.error = error.map(str::to_owned);
+            for collapsed in [false, true] {
+                panel.collapsed = collapsed;
+                assert_eq!(panel.desired_height(48), if collapsed { 2 } else { 12 });
+                let mut buffer = Buffer::empty(area);
+                panel.render(area, &mut buffer);
+                let header = buffer.content[..48]
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                let banner = buffer.content[48..]
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(!header.contains(expected));
+                assert!(banner.contains(expected));
+                assert_eq!(buffer[(47, 1)].bg, color);
+                assert!(buffer[(1, 1)].modifier.contains(Modifier::BOLD));
+            }
+        }
+        panel.lines.clear();
+        panel.collapsed = false;
+        assert_eq!(panel.desired_height(48), 2);
+    }
+
+    #[test]
+    fn status_row_is_excluded_from_picker_clicks_and_resize_rows() {
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.enabled = true;
+        panel.lines = vec![graph_line("*"); 20];
+        panel.action_status = Some("fetch: complete".into());
+        panel.refs = vec!["refs/heads/other".into()];
+        panel.picker = true;
+        let area = Rect::new(0, 20, 80, 12);
+        panel.render(area, &mut Buffer::empty(area));
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 20,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        panel.mouse(event);
+        event.kind = MouseEventKind::Drag(MouseButton::Left);
+        event.row = 18;
+        panel.mouse(event);
+        assert_eq!(panel.visible_rows, 12);
+        event.kind = MouseEventKind::Up(MouseButton::Left);
+        panel.mouse(event);
+        event.kind = MouseEventKind::Down(MouseButton::Left);
+        event.row = 21;
+        panel.mouse(event);
+        assert!(panel.picker);
+        assert!(panel.selected.is_none());
+        event.row = 23;
+        panel.mouse(event);
+        assert_eq!(panel.selected.as_deref(), Some("refs/heads/other"));
+    }
+
+    #[tokio::test]
+    async fn update_button_targets_checkout_and_blocks_overlapping_fetch() {
+        use crate::workspace_command::WorkspaceCommandError;
+        use crate::workspace_command::WorkspaceCommandExecutor;
+        use crate::workspace_command::WorkspaceCommandOutput;
+        use std::future::Future;
+        use std::pin::Pin;
+
+        struct PendingRunner;
+        impl WorkspaceCommandExecutor for PendingRunner {
+            fn run(
+                &self,
+                _command: WorkspaceCommand,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<WorkspaceCommandOutput, WorkspaceCommandError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.runner = Some(Arc::new(PendingRunner));
+        panel.enabled = true;
+        panel.selected = Some("refs/remotes/origin/other".into());
+        panel.lines = vec![graph_line("*")];
+        panel.picker = true;
+        let area = Rect::new(3, 2, 80, 4);
+        panel.render(area, &mut Buffer::empty(area));
+        let mut click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 29, // Closing bracket of [update].
+            row: area.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(panel.mouse(click));
+        assert!(panel.action == Some(GitAction::Update));
+        assert!(panel.selected.is_none());
+        assert!(!panel.picker);
+        click.column = area.x + 14;
+        assert!(panel.mouse(click));
+        assert!(panel.action == Some(GitAction::Update));
+    }
 
     #[test]
     fn parses_graph_fields_and_preserves_merge_lanes() {
@@ -895,7 +1348,7 @@ mod tests {
         assert!(header.contains("main"));
         assert!(!header.contains("other"));
         panel.picker = true;
-        panel.fetching = true;
+        panel.action = Some(GitAction::Fetch);
         panel.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 1,
@@ -903,7 +1356,7 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
         assert_eq!(panel.selected.as_deref(), Some("refs/heads/other"));
-        assert!(panel.fetching);
+        assert!(panel.action == Some(GitAction::Fetch));
     }
 
     #[test]
