@@ -59,7 +59,15 @@ impl GitAction {
         match self {
             Self::Fetch => &["fetch", "--all"],
             // Respect the current branch's upstream; never create a merge, rebase, or stash.
-            Self::Update => &["pull", "--ff-only", "--no-rebase", "--no-autostash"],
+            // Force the fetch phase to accept moved remote tags; HEAD still requires fast-forward.
+            Self::Update => &[
+                "pull",
+                "--ff-only",
+                "--no-rebase",
+                "--no-autostash",
+                "--tags",
+                "--force",
+            ],
         }
     }
 }
@@ -77,6 +85,27 @@ struct ResizeDrag {
     start_row: u16,
     rows: u16,
     max_rows: u16,
+}
+
+enum PickerEntry<'a> {
+    FollowHead,
+    Group(&'static str),
+    Branch(&'a str),
+}
+
+fn picker_entries(refs: &[String]) -> Vec<PickerEntry<'_>> {
+    let mut entries = vec![PickerEntry::FollowHead];
+    for (prefix, label) in [("refs/heads/", "로컬"), ("refs/remotes/", "원격")] {
+        let mut branches = refs
+            .iter()
+            .filter(|reference| reference.starts_with(prefix))
+            .peekable();
+        if branches.peek().is_some() {
+            entries.push(PickerEntry::Group(label));
+            entries.extend(branches.map(|reference| PickerEntry::Branch(reference)));
+        }
+    }
+    entries
 }
 
 pub(super) struct GitGraphPanel {
@@ -323,7 +352,7 @@ impl GitGraphPanel {
         let chrome_height = self.chrome_height();
         let visible = usize::from(area.height.saturating_sub(chrome_height));
         let (scroll, count) = if self.picker {
-            (&self.picker_scroll, self.refs.len() + 1)
+            (&self.picker_scroll, picker_entries(&self.refs).len())
         } else {
             (&self.scroll, self.lines.len())
         };
@@ -360,11 +389,13 @@ impl GitGraphPanel {
             {
                 let index =
                     self.picker_scroll.get() + usize::from(event.row - area.y - chrome_height);
-                if index <= self.refs.len() {
-                    self.selected = index
-                        .checked_sub(1)
-                        .and_then(|index| self.refs.get(index))
-                        .cloned();
+                let selection = match picker_entries(&self.refs).get(index) {
+                    Some(PickerEntry::FollowHead) => Some(None),
+                    Some(PickerEntry::Branch(reference)) => Some(Some((*reference).to_owned())),
+                    Some(PickerEntry::Group(_)) | None => None,
+                };
+                if let Some(selected) = selection {
+                    self.selected = selected;
                     self.picker = false;
                     self.scroll.set(0);
                     self.fingerprint.clear();
@@ -429,12 +460,7 @@ impl Renderable for GitGraphPanel {
         }
         let body = Rect::new(area.x, area.y + chrome_height, area.width, height);
         if self.picker {
-            let mut entries = vec![Line::raw("  Follow HEAD (current checkout)")];
-            entries.extend(
-                self.refs
-                    .iter()
-                    .map(|reference| Line::raw(format!("  {}", clean(reference)))),
-            );
+            let entries = picker_entries(&self.refs);
             let offset = self
                 .picker_scroll
                 .get()
@@ -445,6 +471,20 @@ impl Renderable for GitGraphPanel {
                     .into_iter()
                     .skip(offset)
                     .take(usize::from(height))
+                    .map(|entry| match entry {
+                        PickerEntry::FollowHead => Line::raw("  Follow HEAD (current checkout)"),
+                        PickerEntry::Group(label) => Line::styled(
+                            format!("  {label}"),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                        PickerEntry::Branch(reference) => {
+                            let short = reference
+                                .strip_prefix("refs/heads/")
+                                .or_else(|| reference.strip_prefix("refs/remotes/"))
+                                .unwrap_or(reference);
+                            Line::raw(format!("    {}", clean(short)))
+                        }
+                    })
                     .collect::<Vec<_>>(),
             )
             .render(body, buf);
@@ -1012,7 +1052,14 @@ mod tests {
                     "pull" => {
                         assert_eq!(
                             &command.argv[4..],
-                            &["pull", "--ff-only", "--no-rebase", "--no-autostash"]
+                            &[
+                                "pull",
+                                "--ff-only",
+                                "--no-rebase",
+                                "--no-autostash",
+                                "--tags",
+                                "--force",
+                            ]
                         );
                         assert_eq!(command.timeout, Duration::from_secs(120));
                         (self.action_exit, "", "remote: progress\nfatal: denied\n")
@@ -1179,6 +1226,10 @@ mod tests {
         assert!(panel.picker);
         assert!(panel.selected.is_none());
         event.row = 23;
+        panel.mouse(event);
+        assert!(panel.picker);
+        assert!(panel.selected.is_none());
+        event.row = 24;
         panel.mouse(event);
         assert_eq!(panel.selected.as_deref(), Some("refs/heads/other"));
     }
