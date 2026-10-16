@@ -71,6 +71,15 @@ mod tests {
         assert!(image.get_pixel(6, 1)[3] > 0);
     }
     #[test]
+    fn horizontal_connector_reaches_both_lanes_in_git_collapse_row() {
+        // Real Git --graph row: "| |_|/".
+        let mut request = request(&["", "│ │─│╱", ""], vec![false; 3]);
+        request.area.width = 6;
+        let image = raster(&request);
+        assert!(image.get_pixel(28, 10)[3] > 0);
+        assert!(image.get_pixel(42, 10)[3] > 0);
+    }
+    #[test]
     fn frame_guard_discards_requests_after_early_return() {
         FRAME.with(|slot| {
             *slot.borrow_mut() = Some(Frame {
@@ -275,13 +284,7 @@ fn raster(request: &Request) -> image::RgbaImage {
                 '│' => segment(&mut image, (x, y0), (x, y1), stroke, color),
                 '╲' => segment(&mut image, (x - cw, y0), (x + cw, y1), stroke, color),
                 '╱' => segment(&mut image, (x + cw, y0), (x - cw, y1), stroke, color),
-                '─' => segment(
-                    &mut image,
-                    (x - cw / 2.0, cy),
-                    (x + cw / 2.0, cy),
-                    stroke,
-                    color,
-                ),
+                '─' => segment(&mut image, (x - cw, cy), (x + cw, cy), stroke, color),
                 _ => {}
             }
         }

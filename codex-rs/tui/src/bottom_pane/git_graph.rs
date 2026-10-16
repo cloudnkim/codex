@@ -1,5 +1,7 @@
 //! Cached workspace Git graph. Only explicit clicks fetch remotes or update the checkout.
 use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,6 +78,7 @@ struct Snapshot {
     fingerprint: String,
     branch: String,
     refs: Vec<String>,
+    tracking: BTreeMap<String, (String, Color)>,
     lines: Option<Vec<GraphRow>>,
     action_status: Option<String>,
 }
@@ -108,6 +111,34 @@ fn picker_entries(refs: &[String]) -> Vec<PickerEntry<'_>> {
     entries
 }
 
+fn tracking_label(upstream: &str, track: &str) -> (String, Color) {
+    let Some(remote) = upstream.strip_prefix("refs/remotes/") else {
+        // A local upstream or missing tracking configuration does not prove a branch was pushed.
+        return ("원격 연결 없음".into(), Color::DarkGray);
+    };
+    let (status, color) = match track {
+        "" => ("원격과 동일".into(), Color::Green),
+        "gone" => ("추적 원격 없음".into(), Color::Red),
+        _ => {
+            let status = track
+                .split(", ")
+                .map(|part| {
+                    if let Some(count) = part.strip_prefix("ahead ") {
+                        format!("미푸시 {count}개")
+                    } else if let Some(count) = part.strip_prefix("behind ") {
+                        format!("원격만 {count}개")
+                    } else {
+                        "상태 확인 필요".into()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (status, Color::Yellow)
+        }
+    };
+    (format!("{status} · {}", clean(remote)), color)
+}
+
 pub(super) struct GitGraphPanel {
     frame: FrameRequester,
     cwd: PathBuf,
@@ -118,6 +149,7 @@ pub(super) struct GitGraphPanel {
     fingerprint: String,
     branch: String,
     refs: Vec<String>,
+    tracking: BTreeMap<String, (String, Color)>,
     lines: Vec<GraphRow>,
     selected: Option<String>,
     error: Option<String>,
@@ -128,6 +160,7 @@ pub(super) struct GitGraphPanel {
     scroll: Cell<usize>,
     picker_scroll: Cell<usize>,
     area: Cell<Rect>,
+    selection_surface: RefCell<Option<(Rect, bool, String)>>,
     visible_rows: u16,
     resize_drag: Cell<Option<ResizeDrag>>,
     action: Option<GitAction>,
@@ -145,6 +178,7 @@ impl GitGraphPanel {
             fingerprint: String::new(),
             branch: String::new(),
             refs: Vec::new(),
+            tracking: BTreeMap::new(),
             lines: Vec::new(),
             selected: None,
             error: None,
@@ -155,6 +189,7 @@ impl GitGraphPanel {
             scroll: Cell::new(0),
             picker_scroll: Cell::new(0),
             area: Cell::new(Rect::default()),
+            selection_surface: RefCell::new(None),
             visible_rows: DEFAULT_ROWS,
             resize_drag: Cell::new(None),
             action: None,
@@ -171,7 +206,37 @@ impl GitGraphPanel {
 
     pub(super) fn hide(&self) {
         self.area.set(Rect::default());
+        self.selection_surface.borrow_mut().take();
         self.resize_drag.set(None);
+    }
+
+    pub(super) fn register_selection(
+        &self,
+        selection: &mut crate::rendered_selection::RenderedSelection,
+        buffer: &Buffer,
+    ) {
+        let area = self.area.get();
+        // Leave header buttons and the resize grip on their immediate mouse path.
+        let area = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        )
+        .intersection(buffer.area);
+        if area.is_empty() {
+            self.selection_surface.borrow_mut().take();
+            return;
+        }
+        // Compare painted text, including clipping, status and picker changes, before highlighting.
+        let text = area
+            .positions()
+            .map(|position| buffer[position].symbol())
+            .collect::<String>();
+        let surface = (area, self.picker, text);
+        let changed = self.selection_surface.borrow().as_ref() != Some(&surface);
+        self.selection_surface.replace(Some(surface));
+        selection.register(area, changed);
     }
 
     pub(super) fn sync(
@@ -192,6 +257,7 @@ impl GitGraphPanel {
             self.runner = runner;
             self.lines.clear();
             self.refs.clear();
+            self.tracking.clear();
             self.fingerprint.clear();
             self.selected = None;
             self.error = None;
@@ -218,6 +284,7 @@ impl GitGraphPanel {
                             self.fingerprint = snapshot.fingerprint;
                             self.branch = snapshot.branch;
                             self.refs = snapshot.refs;
+                            self.tracking = snapshot.tracking;
                             if let Some(lines) = snapshot.lines {
                                 self.lines = lines;
                             }
@@ -237,6 +304,7 @@ impl GitGraphPanel {
                         Ok(None) => {
                             self.lines.clear();
                             self.refs.clear();
+                            self.tracking.clear();
                             self.fingerprint.clear();
                             self.hide();
                         }
@@ -474,15 +542,31 @@ impl Renderable for GitGraphPanel {
                     .map(|entry| match entry {
                         PickerEntry::FollowHead => Line::raw("  Follow HEAD (current checkout)"),
                         PickerEntry::Group(label) => Line::styled(
-                            format!("  {label}"),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            format!(
+                                "  {label}{}",
+                                if label == "로컬" {
+                                    " (마지막 fetch 기준)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         PickerEntry::Branch(reference) => {
                             let short = reference
                                 .strip_prefix("refs/heads/")
                                 .or_else(|| reference.strip_prefix("refs/remotes/"))
                                 .unwrap_or(reference);
-                            Line::raw(format!("    {}", clean(short)))
+                            let mut spans = vec![Span::raw(format!("    {}", clean(short)))];
+                            if let Some((status, color)) = self.tracking.get(reference) {
+                                spans.push(Span::styled(
+                                    format!("  [{status}]"),
+                                    Style::default().fg(*color),
+                                ));
+                            }
+                            Line::from(spans)
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -864,7 +948,7 @@ async fn read_snapshot(
         .run(command(
             args(&[
                 "for-each-ref",
-                "--format=%(refname)%09%(objectname)",
+                "--format=%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track,nobracket)",
                 "refs/heads/",
                 "refs/remotes/",
                 "refs/tags/",
@@ -894,6 +978,19 @@ async fn read_snapshot(
         .filter_map(|line| line.split_once('\t').map(|(name, _)| name.to_owned()))
         .filter(|name| valid_ref(name))
         .collect::<Vec<_>>();
+    let tracking = refs
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?;
+            fields.next()?;
+            let upstream = fields.next()?;
+            let track = fields.next()?;
+            name.starts_with("refs/heads/")
+                .then(|| (name.to_owned(), tracking_label(upstream, track)))
+        })
+        .collect();
     let selected = selected.filter(|name| references.contains(name));
     let fingerprint = format!("{}{}{}{:?}", head.stdout, refs.stdout, branch, selected);
     // Tags affect decorations even though the picker contains branches only.
@@ -923,6 +1020,7 @@ async fn read_snapshot(
         fingerprint,
         branch: selected.unwrap_or(branch),
         refs: references,
+        tracking,
         lines,
         action_status,
     }))
@@ -944,6 +1042,51 @@ fn valid_ref(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_body_selects_hash_and_invalidates_changed_text() {
+        let mut panel = GitGraphPanel::new(FrameRequester::test_dummy());
+        panel.enabled = true;
+        panel.lines = vec![graph_line("*\u{1f}abc1234\u{1f}\u{1f}subject\u{1f}author")];
+        let area = Rect::new(0, 0, 80, 4);
+        let mut buffer = Buffer::empty(area);
+        let mut selection = crate::rendered_selection::RenderedSelection::default();
+        panel.render(area, &mut buffer);
+        panel.register_selection(&mut selection, &buffer);
+        assert_eq!(selection.areas, vec![Rect::new(0, 1, 80, 3)]);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 5),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            selection.handle_event(
+                &crate::tui::TuiEvent::Mouse(MouseEvent {
+                    kind,
+                    column,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+                &buffer,
+            );
+        }
+        assert_eq!(
+            selection.view.selected_text(&selection.cells).as_deref(),
+            Some("abc1234")
+        );
+        selection.areas.clear();
+        panel.render(area, &mut buffer);
+        panel.register_selection(&mut selection, &buffer);
+        assert!(selection.view.has_selection_range());
+        panel.lines[0].hash = Some("def5678".into());
+        selection.areas.clear();
+        panel.render(area, &mut buffer);
+        panel.register_selection(&mut selection, &buffer);
+        assert!(!selection.view.has_selection_range());
+        panel.hide();
+        selection.areas.clear();
+        panel.register_selection(&mut selection, &buffer);
+        assert!(selection.areas.is_empty());
+    }
 
     #[test]
     fn drag_resizes_outside_panel_and_stops_on_release_or_hide() {
